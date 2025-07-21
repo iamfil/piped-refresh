@@ -1,0 +1,138 @@
+name: Check Alpine and build image
+
+on:
+  schedule:
+    - cron: '15 17 * * *' # 17:15 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  check-alpine:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq curl
+
+      - name: Get digest for alpine:latest
+        id: digest
+        run: |
+          DIGEST=$(skopeo inspect docker://docker.io/library/alpine:latest | jq -r .Digest)
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          echo "Alpine latest digest: $DIGEST"
+
+      - name: Read stored digest
+        id: current
+        run: |
+          if [ -f alpine_digest.txt ]; then
+            echo "current_digest=$(cat alpine_digest.txt)" >> $GITHUB_OUTPUT
+          else
+            echo "current_digest=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Exit early if digest is current
+        id: early_exit
+        run: |
+          if [ "${{ steps.digest.outputs.digest }}" = "${{ steps.current.outputs.current_digest }}" ]; then
+            echo "Digest is up-to-date. No action needed."
+            echo "exit=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Match digest to tag
+        id: version
+        if: steps.early_exit.outputs.exit != 'true'
+        run: |
+          DIGEST="${{ steps.digest.outputs.digest }}"
+          MATCHED_TAG=""
+          PAGE=1
+
+          while [ -z "$MATCHED_TAG" ]; do
+            echo "Fetching tags page $PAGE..."
+            TAGS=$(curl -s "https://registry.hub.docker.com/v2/repositories/library/alpine/tags?page_size=10&page=$PAGE" | jq -r '.results[].name')
+
+            [ -z "$TAGS" ] && break
+
+            for TAG in $TAGS; do
+              [ "$TAG" = "latest" ] && continue
+              echo "Checking alpine:$TAG..."
+              TAG_DIGEST=$(skopeo inspect docker://docker.io/library/alpine:$TAG | jq -r .Digest 2>/dev/null || true)
+
+              if [ "$TAG_DIGEST" = "$DIGEST" ]; then
+                MATCHED_TAG=$TAG
+                echo "Found matching tag: $MATCHED_TAG"
+                break 2
+              fi
+            done
+
+            PAGE=$((PAGE + 1))
+          done
+
+          if [ -z "$MATCHED_TAG" ]; then
+            echo "No matching tag found for digest: $DIGEST"
+            exit 1
+          fi
+
+          echo "tag=$MATCHED_TAG" >> $GITHUB_OUTPUT
+
+      - name: Commit new digest and create versioned tag
+        id: commit
+        if: steps.early_exit.outputs.exit != 'true' && steps.digest.outputs.digest != steps.current.outputs.current_digest
+        run: |
+          echo "${{ steps.digest.outputs.digest }}" > alpine_digest.txt
+
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git add alpine_digest.txt
+          git commit -m "ci: update alpine digest to ${{ steps.digest.outputs.digest }}"
+          git push
+
+          TAG="alpine-${{ steps.version.outputs.tag }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+          
+          echo "new_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Log in to GitHub Container Registry
+        if: steps.early_exit.outputs.exit != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set Docker image name
+        id: meta
+        if: steps.early_exit.outputs.exit != 'true'
+        run: |
+          IMAGE_NAME=ghcr.io/${{ github.repository_owner }}/$(basename ${{ github.repository }} | tr '[:upper:]' '[:lower:]')
+          VERSION_TAG="alpine-${{ steps.version.outputs.tag }}"
+          echo "image=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "tag=$VERSION_TAG" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image with metadata labels
+        if: steps.early_exit.outputs.exit != 'true'
+        run: |
+          docker build \
+            --label "org.opencontainers.image.source=${{ github.repositoryUrl }}" \
+            --label "org.opencontainers.image.revision=${{ steps.commit.outputs.new_sha }}" \
+            --label "org.opencontainers.image.version=alpine-${{ steps.meta.outputs.tag }}" \
+            --label "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --label "org.opencontainers.image.description=A script to refresh channels on a Piped instance built from Alpine Linux and updated automatically." \
+            --label "org.opencontainers.image.licenses=GPL-3.0-or-later" \
+            -t ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }} \
+            -t ${{ steps.meta.outputs.image }}:latest .
+
+      - name: Push Docker images
+        if: steps.early_exit.outputs.exit != 'true'
+        run: |
+          docker push ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          docker push ${{ steps.meta.outputs.image }}:latest
